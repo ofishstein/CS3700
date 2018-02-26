@@ -1,0 +1,61 @@
+Campbell Alden and Oliver Fishstein
+CS 3700 - Networks and Distributed Systems 
+Project 2
+
+High Level Approach
+----
+
+Our high level approach was to build an object oriented python script and created a seperate message_utils.py to create utils and classes for handling the packets and message types received and sent throughout this project.
+
+Our main script parses the command line arguments and creates a Bridge object based off those parameters. It then runs the Bridge. The main functionalilty of the program exits within internal functions for our Bridge and Port objects.
+
+A Bridge has functions to:
+	pruneRoutes	 	-> updates routing table with new values or after timeouts
+	broadcast 		-> broadcasts a packet to all ports except the 
+						receiver
+	handleData	 	-> handles data packets by displaying 
+						appropriate messages and choosing where/if to forward packets
+	handleBPDU	 	-> handles BPDU packets by displaying 
+						appropriate messages and deciding when to update root and disable ports
+	handlePacket	-> deligates to the specific handle function 
+						based on type
+	refreshBPDUs	-> handles BDPU timeouts and initates the building 
+						of a new MST 
+	run 			-> core function that sets up intial ports and 
+						runs the loop for sending/receiving packets and updating the route and BPDUs
+
+
+A Port has functions to:
+	enabled			-> returns if port is enabled
+	enabled 		-> sets the port to enabled or disabled
+	enable 			-> enables and sets up socket
+	disable 		-> marks port as disabled and not open to data 
+						packets
+	send 			-> sends packets
+	recv 			-> receives packets
+	needsReconstruct-> determines whether the BPDU message timedout 
+
+This allows for us to keep our code readable and easy to debug.
+Our message_utils consists of an abstract Serializable class and a Packet class along with util functions. Packet inherits the ability to serialize into JSON from our Serializable class.
+The three functions are as follows:
+json2Packet			-> decodes JSON into a usable Packet object
+makeBpdu			-> makes a Packet object fitting the format for 
+						a Bpdu type
+makeData			-> makes a Packet object fitting the format for 
+						a data type
+
+Challenges
+---
+
+We ran into difficulties handling the case where a LAN is on multiple bridges and correctly disabling ports on those bridges after deciding which bridge owns a LAN.   
+
+The specific case of two hosts on the same LAN which is connected to multiple bridges gave us issues in test case 6. 
+
+We ran into difficulties when handling BPDU timeouts due to an initial misunderstanding of the timeout process where we rebuilt every 750 ms which led to issues with convergance instead of checking timeout and rebuilding then. 
+
+Testing
+---
+
+We ran each individual test to confirm functionality looking at the results and print outs to confirm correct behavior. 
+
+We added DEBUG messages throughout to check the MST building and logic while running the various test cases and checked against drawn MST.

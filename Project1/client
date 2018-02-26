@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+import argparse
+import socket
+import ssl
+import sys
+import re
+
+
+HEADER = 'cs3700fall2017'
+STATUS_RE = r'-?\d+ [+-\\*/] -?\d+'
+EXIT_RE = HEADER + r' (.*) BYE'
+PORT = 27998    # default port value
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--port', help="The port to communicate over", type=int)
+    parser.add_argument('-s', help="Use ssl", action='store_true')
+    parser.add_argument('hostname', help="The name of the host to connect to")
+    parser.add_argument('NUID', help="Your nu id")
+    return parser.parse_args()
+
+def send_message(socket, message_type, data):
+    message = HEADER + ' ' + message_type + str(data) + '\n'
+    socket.send(message.encode('ascii'))
+    return socket.recv(256)
+
+def calculate(problem):
+    return int(eval(problem))
+
+if __name__ == '__main__':
+    args = get_args()
+
+    sock = socket.socket()
+    ADDRESS = args.hostname
+    port = args.port if args.port is not None else PORT
+    sock.connect((ADDRESS, port))
+    if args.s:
+        try:
+            sock = ssl.wrap_socket(sock)
+        except ssl.SSLError:
+            print("Failed to create SSL socket on port {}".format(port))
+            sys.exit(1)
+
+    response = send_message(sock, 'HELLO ', args.NUID)
+    SolutionCount = 0
+    while True:
+        isDone = re.search(EXIT_RE, str(response))
+        if isDone is not None:
+            print (isDone.group(1))
+            break # Exit the infinite loop.
+        else:
+            match = re.search(STATUS_RE, str(response))
+
+            if match is None:
+                print("Error in input string '{}'".format(repr(response)))
+                break
+            else:
+                result = calculate(match.group(0))
+                response = send_message(sock, '', result)
+                SolutionCount += 1

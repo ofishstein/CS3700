@@ -1,0 +1,255 @@
+#!/usr/bin/python3 -u
+# The -u makes output unbuffered, so it will show up immediately
+import sys
+import socket
+import select
+import time
+
+import message_utils
+
+MAX_RECEIVE = 1500  # bytes
+
+
+# pads the name with null bytes at the end
+def pad(name):
+        result = '\0' + name
+        while len(result) < 108:
+                result += '\0'
+        return result
+
+
+class Port():
+
+    def __init__(self, id, lan):
+        self.id = id
+        self.lan = lan
+        self.socket = None
+        self._enabled = False
+        self.lastBDPU = None
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    @enabled.setter
+    def enabled(self, enable):
+        if enable:
+            self.enable()
+        else:
+            self.disable()
+
+    def enable(self):
+        if self.socket is None:
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.socket.connect(pad(self.lan))
+        self._enabled = True
+
+    def disable(self):
+        self._enabled = False
+
+    def send(self, msg):
+        self.socket.send(msg)
+
+    def recv(self, count=MAX_RECEIVE):
+        return self.socket.recv(count)
+
+    def needsReconstruct(self):
+        return self.lastBDPU is not None and time.time() - self.lastBDPU > 0.750
+
+
+class Bridge():
+
+    def __init__(self, id, lans, start=0, stop=None, bdpuRate=0.5):
+        self.id = id
+        self.lans = lans
+        self.bdpuRate = bdpuRate
+        self._lastBdpuBroadcast = 0
+        self.ports = []
+        self.routes = {}
+        self.root = (id, 0, id)
+        self.rootPort = None
+        self._lanPorts = {}
+        self.start = start
+        self.stop = stop
+
+    def setRootPort(self, port):
+        self.rootPort = port
+
+    def pruneRoutes(self, port=None):
+        ''' Prune the port from the routing table.'''
+        newRoutes = {}
+        for source, route in self.routes.items():
+            if route[0] is not port and time.time() - route[1] < 5:
+                newRoutes[source] = route
+        self.routes = newRoutes
+
+    def broadcast(self, packet, port):
+        print("Broadcasting message {} to all ports".format(packet.message['id']))
+        for broadcastPort in self.ports:
+            if broadcastPort.enabled and broadcastPort is not port:
+                broadcastPort.send(packet.serialize())
+
+    def handleData(self, packet, port):
+        print('Received message {} on port {} from {} to {}'.format(packet.message['id'],
+                                                                    port.id,
+                                                                    packet.source,
+                                                                    packet.dest))
+        if packet.dest == 'ffff':
+            self.broadcast(packet, port)
+            return # quit early
+
+        if packet.source not in self.routes:
+            self.routes[packet.source] = (port, time.time())
+
+        if packet.dest in self.routes:
+            destPort = self.routes[packet.dest][0]
+            if destPort is port:
+                print ("Not forwarding message {}".format(packet.message['id']))
+            else:
+                print("Forwarding message {} to port {}".format(packet.message['id'], port.id))
+                self.routes[packet.dest][0].send(packet.serialize())
+        else:
+            self.broadcast(packet, port)
+
+    def handleBDPU(self, packet, port):
+
+        port.lastBDPU = time.time()
+        # Seeing a BDPU on a port means the port is eligible for disabling.
+        updated = False
+        currentRoot, currentCost, currentRootBridge = self.root
+
+        testRoot = packet.message['root']
+        testCost = packet.message['cost'] + 1
+        testBridge = packet.source
+
+        useBDPUCase1 = testRoot < currentRoot
+        useBDPUCase2 = testRoot == currentRoot and testCost < currentCost
+        useBDPUCase3 = testRoot == currentRoot and testCost == currentCost and testBridge < currentRootBridge
+
+        if useBDPUCase1:
+            self.root = (testRoot, testCost, testBridge)
+            self.setRootPort(port)
+            print("New root: {}/{}".format(self.id, self.root[0]))
+            print("Root port: {}/{}".format(self.id, port.id))
+            updated = True
+        elif useBDPUCase2:
+            self.root = (testRoot, testCost, testBridge)
+            self.setRootPort(port)
+            print("Root port: {}/{}".format(self.id, port.id))
+            updated = True
+        elif useBDPUCase3:
+            self.root = (testRoot, testCost, testBridge)
+            self.setRootPort(port)
+            print("Designated port: {}/{}".format(self.id, testBridge))
+            print("Root port: {}/{}".format(self.id, port.id))
+            updated = True
+
+        if port.enabled:
+            if not (self.rootPort is None or self.rootPort is port) and testRoot == self.root[0]:
+                disableCase1 = currentCost > packet.message["cost"]
+                disableCase2 = currentCost == packet.message["cost"] and self.id > testBridge
+                disableCase3 = currentCost == testCost and currentRootBridge > testBridge
+                if disableCase1 or disableCase2 or disableCase3:
+                    port.disable()
+                    self.pruneRoutes(port)
+                    print("Disabled port: {}/{}".format(self.id, port.id))
+                else:
+                    print("DEBUG {} -- {} {} {}".format(self.id, disableCase1, disableCase2, disableCase3))
+
+        if updated:
+            self.sendBDPUs()
+
+        # implicit else clause is that we don't update
+
+
+    def handlePacket(self, packet, port):
+        if packet.type == 'data' and port.enabled:
+            self.handleData(packet, port)
+        elif packet.type == 'bdpu':
+            self.handleBDPU(packet, port)
+
+    def handlePortReady(self, port):
+        # Receive packets
+        rawData = port.recv()
+        packetStrings = rawData.decode('utf-8').split('\n')
+        for packetString in packetStrings:
+            self.handlePacket(message_utils.json2Packet(packetString), port)
+
+
+    def refreshBDPUs(self):
+        print("[DEBUG] -- Refreshing BDPU's and routes")
+
+        for port in self._lanPorts.values():
+            port.enable() # Reenable all LAN ports.
+            port.lastBDPU = None
+
+        self.rootPort = None
+        self.root = (self.id, 0, self.id)
+        self.sendBDPUs()
+
+    def sendBDPUs(self):
+        for port in self.ports:
+            if port.enabled:
+                bdpuMsg = message_utils.makeBdpu(self.id,
+                                                'ffff',
+                                                self.root[0],
+                                                self.root[1],
+                                                self.root[2])
+                port.send(bdpuMsg.serialize())
+        self._lastBdpuBroadcast = time.time()
+
+    def run(self):
+        liveTime = time.time()
+        time.sleep(self.start)
+
+        print("Bridge " + self.id + " starting up\n")
+
+        # Create all sockets
+        for i, lan in enumerate(self.lans):
+            self.ports.append(Port(i, lan))
+            self.ports[i].enable()
+            if lan not in self._lanPorts:
+                self._lanPorts[lan] = self.ports[i]
+            else:
+                self.ports[i].disable()
+            print("Designated port: {}/{}".format(self.id, i))
+
+        self.sendBDPUs()
+        while (self.stop is None) or (time.time() - liveTime < self.stop):
+
+            if self.rootPort is None:
+                print('[DEBUG] ------- Bridge {} is root'.format(self.id))
+
+            onOff = ''
+            for port in self.ports:
+                if port.enabled:
+                    onOff += " 1"
+                else:
+                    onOff += " 0"
+
+            print("[DEBUG] -- Bridge {} port state: {}".format(self.id, onOff))
+
+            ###### Using raw sockets here #######
+            sockets = {}
+            for port in self._lanPorts.values():
+                sockets[port.socket] = port
+
+            ready, _, _ = select.select(sockets.keys(), [], [], 0.5)
+
+            for lan in ready:
+                self.handlePortReady(sockets[lan])
+            ########### end raw sockets #########
+
+            if time.time() - self._lastBdpuBroadcast > self.bdpuRate:
+                self.sendBDPUs()
+
+            if any([port.needsReconstruct() for port in self._lanPorts.values()]):
+                self.refreshBDPUs()
+
+            self.pruneRoutes()
+
+if __name__ == "__main__":
+        id = sys.argv[1]
+        LAN = sys.argv[2:]
+        bridge = Bridge(id, LAN)
+        bridge.run()

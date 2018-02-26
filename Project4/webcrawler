@@ -1,0 +1,188 @@
+#!/usr/bin/python -u
+import sys
+import socket
+import re
+from collections import deque
+
+# global variables
+HOST = "fring.ccs.neu.edu"
+PORT = 80
+RECV_BUFFSIZE = 100000 # arbitrarily huge
+LOGIN_PATH = "/accounts/login/"
+CSRF_TOKEN_REGEX = r'(csrftoken=)(\w{32})'
+SESSION_ID_REGEX = r'(sessionid=)(\w{32})'
+LOCATION_REGEX = r'(Location: .+.edu)(.+)'
+
+class WebCrawler(object):
+    def __init__(self, username, password):
+        # login credentials
+        self.username = username
+        self.password = password
+        # cookies
+        self.sessionId = ""     # we get this from the initial login process
+        self.csrfToken = ""     # we get this from the initial login process
+        # socket to reuse
+        self.socket = None
+        # crawler info to track
+        self.pathsToVisit = deque()   # queue of paths to visit
+        self.visitedPaths = []        # track to make sure we don't keep visiting same paths
+        # flags to track - need to find 5
+        self.secretFlags = []
+
+    # initialize and connect to a socket object
+    def initSocket(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((HOST, PORT))
+
+    # login and begin crawling process
+    def start(self):
+        # open socket
+        self.initSocket()
+        # login
+        self.login()
+        # crawl server
+        self.crawl()
+
+    # go through login sequence
+    def login(self):
+        # load initial login page
+        response = self.sendGetRequest(LOGIN_PATH)
+        # get cookies from response - has set-cookie headers for sessionId and csrfToken
+        self.setCookies(response)
+        # login to server
+        response = self.sendLoginPostRequest()
+        # get cookie from response - has set-cookie header for sessionId
+        self.setCookies(response)
+
+    # crawling sequence
+    def crawl(self):
+        # add homepage to visitedPaths post login in both forms so we don't revist in a loop
+        self.visitedPaths.append("/fakebook/")
+        self.visitedPaths.append("/fakebook")
+        # start at homepage
+        self.pathsToVisit.append("/fakebook/")
+
+        while len(self.pathsToVisit) > 0:
+            path = self.pathsToVisit[0]
+            response = self.sendGetRequest(path)
+            responseCode = self.getResponseCode(response)
+
+            if responseCode == 200:
+                # parse url paths from response and add to pathsToVisit
+                self.parseUrlPaths(response)
+                self.parseSecretFlags(response)
+                self.pathsToVisit.popleft()     # remove from queue
+                self.visitedPaths.append(path)  # add to visited
+                self.areAllFlagsFound()         # check if crawling done
+            elif responseCode == 301 or responseCode == 302:
+                self.handleRedirect(response)
+                self.pathsToVisit.popleft()     # remove from queue
+            elif responseCode == 403 or responseCode == 404:
+                self.pathsToVisit.popleft()     # remove from queue
+            elif responseCode == 500:
+                continue                        # retry the link
+
+    # parse url paths from the html response
+    def parseUrlPaths(self, response):
+        # Parse all unique link tags starting with /fakebook/
+        urls = set(re.findall(r'href=[\'"]?(/fakebook/[^\'" >]+)', response))
+        for url in urls:
+            # If the URL is not already visited and not already queued
+            if url not in self.visitedPaths and url not in self.pathsToVisit:
+                # Append to the queue
+                self.pathsToVisit.append(url)
+
+    # parse the secret flags from the html response
+    def parseSecretFlags(self, response):
+        if "FLAG" in response:
+            flags = re.findall(r'FLAG: ([^\'\" ><]+)', response)
+            for flag in flags:
+                self.secretFlags.append(flag)
+
+    # check if all secret flags are found and print them
+    def areAllFlagsFound(self):
+        if len(self.secretFlags) == 5:
+            for flag in self.secretFlags:
+                print flag
+            # crawler is done so exit
+            sys.exit(0)
+
+    # send a get request
+    def sendGetRequest(self, path):
+        request = self.buildGetRequest(path)
+        self.socket.sendall(request)
+        response = self.socket.recv(RECV_BUFFSIZE)
+
+        # If the socket has been closed or empty response
+        if len(response) < 10:
+            # Create a new socket
+            self.initSocket()
+            # Try again
+            return self.sendGetRequest(path)
+
+        # Handle chunking
+        if "<html>" in response:
+            while "</html>" not in response:
+                response += self.socket.recv(RECV_BUFFSIZE)
+        return response
+
+    # build the message for a get request
+    def buildGetRequest(self, path):
+        request = "GET " + path + " HTTP/1.1\r\nHost: " + HOST + "\r\nCookie: csrftoken=" + self.csrfToken + "; sessionid=" + self.sessionId + "\r\nConnection:keep-alive\r\n\r\n"
+        return request
+
+    # post a login
+    def sendLoginPostRequest(self):
+        request = self.buildLoginPostRequest()
+        self.socket.sendall(request)
+        response = self.socket.recv(RECV_BUFFSIZE)
+        return response
+
+    # build the request string for a login post
+    def buildLoginPostRequest(self):
+        content = "csrfmiddlewaretoken=" + self.csrfToken + "&username=" + self.username + "&password=" + self.password + "&next=%2Ffakebook%2F"
+        request = "POST " + LOGIN_PATH + " HTTP/1.1\r\nHost: " + HOST + "\r\nReferrer: " + HOST + LOGIN_PATH + "\r\nCookie: csrftoken=" + self.csrfToken + "; sessionid=" + self.sessionId + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + str(len(content)) + "\r\nConnection:keep-alive\r\n\r\n" + content + "\r\n"
+        return request
+
+    # parse the response for cookies and set them
+    def setCookies(self, response):
+        csrfToken = re.search(CSRF_TOKEN_REGEX, response)
+        sessionId = re.search(SESSION_ID_REGEX, response)
+
+        if csrfToken is not None:
+            self.csrfToken = csrfToken.group(2)
+        if sessionId is not None:
+            self.sessionId = sessionId.group(2)
+
+    # get the response code from the response
+    def getResponseCode(self, response):
+        if "200 OK" in response:
+            return 200
+        elif "301 MOVED PERMANENTLY" in response:
+            return 301
+        elif "302 FOUND" in response:
+            return 302
+        elif "403 FORBIDDEN" in response:
+            return 403
+        elif "404 NOT FOUND" in response:
+            return 404
+        elif "500 INTERNAL SERVER ERROR" in response:
+            return 500
+        else:
+            raise ValueError("Unexpected Response: " + response)
+
+    # handle the redirect
+    def handleRedirect(self, response):
+        redirectPath = re.search(LOCATION_REGEX, response)
+
+        if (redirectPath is not None) and (redirectPath.group(2) not in self.pathsToVisit):
+            self.pathsToVisit.append(redirectPath.group(2))
+
+
+# main function
+if __name__ == '__main__':
+    username = sys.argv[1]
+    password = sys.argv[2]
+
+    webCrawler = WebCrawler(username, password)
+    webCrawler.start()

@@ -1,0 +1,213 @@
+#!/usr/bin/python -u
+#
+# CS3700, Spring 2015
+# Project 2 Starter Code
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+import hashlib
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+class Sender(object):
+	# init methods
+	def __init__(self, dest):
+		self.sent_data_dict = dict()  # Keep track of sent packets
+		self.acked_data_dict = dict()  # Keep track of the timeouts of sent packets
+		self.sent_data_timer_dict = dict()  # Keep track of how many ACKs for each sent packet
+
+		self.cwnd = 1.0
+		self.ssthresh = 10000.0
+
+		self.add_incr = 0
+		self.round_trip_time = 0.5
+		self.last_sent_byte = 0
+
+		self.dest = dest
+		self.sock = self.init_socket()
+
+	# set up the socket
+	def init_socket(self):
+		sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+		sock.settimeout(TIMEOUT)
+		return sock
+
+	# main method for handling program
+	def send(self):
+		# Send first packet
+		self.transmit_packet()
+		self.timer = time.time()
+
+		# Now read in data, send packets
+		while True:
+			try:
+				# Retransmit any timed out packets
+				self.retransmit_packet()
+				# Process any ACKs we receive
+				if time.time() - self.timer >= 1:
+					# Calculate new congestion window
+					self.calc_cong_wind_timeout()
+				(data, addr) = self.sock.recvfrom(MSG_SIZE)
+				if (not self.process_ack(data)):
+					# Determine whether to break the loop
+					break
+			except:
+				pass
+
+		self.transmit_eof()
+
+	# Transmit EOF packet
+	def transmit_eof(self):
+		# Send several times to make sure it gets through
+		checksum = self.build_checksum([SEQUENCE, "", False, True])
+		for x in range(5):
+			self.sock.sendto(json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False, "checksum" : checksum}), self.dest)
+		log("[Sent EOF]: Stopping...")
+
+	## methods for sending data    
+
+	# build a checksum from the data
+	def build_checksum(self, data):
+		data_string = ''.join([str(x) for x in data])
+		return hashlib.md5(data_string).hexdigest()
+
+	# calc congestion window after a timeout
+	def calc_cong_wind_timeout(self):
+		log("[Error]: Socket timeout")
+		# Multiplicative decrease
+		self.ssthresh = max(self.cwnd / 2.0, 2)
+		self.cwnd = 1.0
+		log("[Sliding Window Timeout]: cwnd: " + str(self.cwnd) + " ssthresh: " + str(self.ssthresh))
+		# Reset socket timeout
+		self.timer = time.time()
+
+	# calc congestion window after 3 duplicate acks are recieved
+	def calc_cong_wind_dup_acks(self):
+		self.ssthresh = max(self.cwnd / 2.0, 2)
+		self.cwnd = max(self.ssthresh, 1)
+
+	# calc congestion window after an ack is received
+	def calc_cong_wind_ack(self):
+		if self.cwnd < self.ssthresh:
+			# Slow start
+			self.cwnd += 1.0
+		else:
+			# Congestion avoidance
+			self.cwnd += 1.0 / self.cwnd
+		log("[Sliding Window ACK]: cwnd: " + str(self.cwnd) + " ssthresh: " + str(self.ssthresh))
+
+	# transmits packet
+	def transmit_packet(self):
+		# Transmit a number of packets equal to cwnd
+		for x in range(int(self.cwnd)):
+			# read in chunks of data
+			data = sys.stdin.read(DATA_SIZE)
+			sequence_num = SEQUENCE + (x * DATA_SIZE)
+
+			if (len(data) > 0):
+				# Attempt to send the next packet
+				checksum = self.build_checksum([sequence_num, data, False, False])
+				msg = json.dumps({"sequence": sequence_num, "data": data, "ack": False, "eof": False, "checksum" : checksum})
+				if self.sock.sendto(msg, self.dest) < len(msg):
+					log("[Error]: Unable to fully send data")
+				else:
+					# Data successfully sent, set the packet timeout
+					log("[Send Data]: " + str(sequence_num) + " (" + str(len(data)) + ")")
+					self.sent_data_timer_dict[str(sequence_num)] = time.time()
+
+				# Add packet to sent_data_dict
+				self.sent_data_dict[str(sequence_num)] = msg
+			else:
+				# No remaining data. Stop the main loop if sent_data_dict is empty
+				return len(self.sent_data_dict) != 0
+		# Continue the main loop by default
+		return True
+
+	# retransmits unacked packet
+	def retransmit_packet(self):
+		# For each sent, unACKed packet
+		for sequence_num in self.sent_data_timer_dict.keys():
+			# Check if the packet has timed out
+			if time.time() - self.sent_data_timer_dict[sequence_num] >= (.2 * self.cwnd):
+				# Attempt to retransmit
+				msg = self.sent_data_dict[sequence_num]
+				if self.sock.sendto(msg, self.dest) < len(msg):
+					log("[Error]: Unable to fully resend packet")
+				else:
+					# Data successfully resent, reset the packet timer
+					log("[Resend Data]: " + sequence_num)
+					self.sent_data_timer_dict[sequence_num] = time.time()
+
+	## methods for processing acks
+
+	# decode message from receiver into a usable json form
+	def parse_receiver_msg(self, data):
+		return json.loads(data)
+
+	# handle information from ack
+	def process_ack(self, data):
+		global SEQUENCE
+		try:
+			self.timer = time.time()
+			decoded = self.parse_receiver_msg(data)
+			sequence_num_str = str(decoded['ack'])
+			expected_seq_str = decoded['expected_seq']
+
+			# handle duplicate acks
+			if (decoded['ack'] > decoded['expected_seq']):
+				self.acked_data_dict[expected_seq_str] = self.acked_data_dict.get(expected_seq_str, 0) + 1
+				if self.acked_data_dict[expected_seq_str] == 3:
+					self.handle_dup_ack(decoded)           
+					self.acked_data_dict[expected_seq_str] = 0
+
+			# If we got an ACK for an unACKed packet, send the next packet
+			if sequence_num_str in self.sent_data_dict.keys():
+				log("[Recv ACK]: " + sequence_num_str)
+				# Add ACKed packet to acked_data_dict
+				self.acked_data_dict[sequence_num_str] = self.sent_data_dict[sequence_num_str]
+				# Remove ACKed packet from sent_data_dict and its associated timeout
+				del self.sent_data_dict[sequence_num_str]
+				del self.sent_data_timer_dict[sequence_num_str]
+				# Increment the sequence number to expect the next packet
+				SEQUENCE += DATA_SIZE
+				# Calculate the new congestion window
+				self.calc_cong_wind_ack()
+				# Transmit next set of packets if every sent packet was ACKed
+				if len(self.sent_data_dict) == 0:
+					# (Returning this allows us to determine whether to break the main loop)
+					return self.transmit_packet()
+		except (ValueError, KeyError, TypeError):
+			log("[Error]: Received corrupt packet")
+		# By default, do not break the main loop
+		return True
+
+	# handle three duplicate acks
+	def handle_dup_ack(self, data):
+		self.calc_cong_wind_dup_acks()
+		msg = self.sent_data_dict[data['expected_seq']]
+		# Resend the missing packet
+		if self.sock.sendto(msg, self.dest) < len(msg):
+			log("[Error]: Unable to fully resend packet")
+		else:
+			log("[Resend Data]: " + data['expected_seq'])
+
+
+if __name__ == '__main__':
+  # bind to localhost and an ephemeral port
+  IP_PORT = sys.argv[1]
+  UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+  UDP_PORT = int(IP_PORT[IP_PORT.find(":")+1:])
+  dest = (UDP_IP, UDP_PORT)
+  MSG_SIZE = 1500
+  DATA_SIZE = 1000
+  TIMEOUT = 0.0
+  SEQUENCE = 0
+
+  sender = Sender(dest)
+  sender.send()

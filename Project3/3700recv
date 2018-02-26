@@ -1,0 +1,144 @@
+#!/usr/bin/python -u
+#
+# CS3700, Spring 2015
+# Project 2 Starter Code
+#
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+import hashlib
+
+def log(string):
+  sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+class Receiver(object):
+  def __init__(self):
+    # init to 0 because we will get this from socket.recvfrom
+    self.addr = 0
+    self.current_sequence_num = 0
+    self.sock = self.init_socket()
+    self.packet_buffer = dict()
+
+  def init_socket(self):
+    global UDP_PORT
+    # set up the socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) 
+    sock.bind((UDP_IP, UDP_PORT))
+    sock.settimeout(TIMEOUT)
+
+    # get port we bound to
+    UDP_PORT = sock.getsockname()[1]
+    # Don't change this log message at all, it breaks the run script
+    log("[bound] " + str(UDP_PORT))
+    return sock
+
+  # main method to handle receiving
+  def receive(self):
+    # listen for packets
+    while True:
+      try:
+        (data, self.addr) = self.sock.recvfrom(MSG_SIZE)
+        self.process_packet(data)
+      except socket.timeout:
+        log("[Error]: Socket timeout")
+
+  ## methods for handling received data
+
+  # unpack packet into a usable json form
+  def parse_sender_msg(self, packet):
+    return json.loads(packet)
+
+  # handle the info from the packet
+  def process_packet(self, data):
+    try:
+      decoded = self.parse_sender_msg(data)
+
+      # commented out checksum stuff for now to focus on acks
+      if (self.check_packet_valid(decoded)): 
+      # add packet to buffer
+        if (decoded['sequence'] not in self.packet_buffer):
+          self.packet_buffer[decoded['sequence']] = {'packet_data': '', 
+                                                     'in_buffer': False,
+                                                     'eof': False}
+
+        if not self.packet_buffer[decoded['sequence']]['in_buffer']:
+          self.packet_buffer[decoded['sequence']]['in_buffer'] = True
+          self.packet_buffer[decoded['sequence']]['eof'] = decoded['eof']
+          self.packet_buffer[decoded['sequence']]['data'] = decoded['data']
+
+          if (decoded['sequence'] != self.current_sequence_num):
+            log("[Accept Data]: " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) +
+              ") (out-of-order)")
+          else:
+            log("[Accept Data]: " + str(decoded['sequence']) + " (" + str(len(decoded['data'])) + 
+              ") (in-order)")
+
+            # iterate through buffer to process all in order buffered packets 
+            while (self.current_sequence_num in self.packet_buffer) and (self.packet_buffer[self.current_sequence_num]['in_buffer']):
+              # print data for each in order packet
+              sys.stdout.write(self.packet_buffer[self.current_sequence_num]['data'])
+
+              # if the EOF flag is set, exit
+              if (self.packet_buffer[self.current_sequence_num]['eof']):
+                self.on_finished(self.packet_buffer[self.current_sequence_num])
+              else:
+                # increment expected sequence number
+                self.current_sequence_num += len(self.packet_buffer[self.current_sequence_num]['data'])
+      
+        # Send an ACK regardless of sequence number
+        self.send_ack(decoded['sequence']) 
+
+      else:
+        log("[Error]: Received corrupt packet")
+
+    except (ValueError, KeyError, TypeError) as e:
+      log("[Error]: Received corrupt packet")
+      raise e
+
+  # TODO build a checksum from the data
+  def build_checksum(self, data):
+    data_string = ''.join([str(x) for x in data])
+    #log("data string for checksum " + data_string)
+    return hashlib.md5(data_string).hexdigest()
+
+  # TODO check if built checksum matches packet checksum
+  def check_packet_valid(self, packet):
+    #log ("seq = " + str(packet['sequence']) + " data = " + str(packet['data']))
+    recv_checksum = self.build_checksum([packet['sequence'], packet['data'], packet['ack'], packet['eof']])
+    #log("checksum = " + str(packet['checksum']) + " calc checksum = " + str(recv_checksum))
+    return packet['checksum'] == recv_checksum
+
+  ## methods for responding
+
+  # send an ack to sender
+  def send_ack(self, sequence_num):
+    # Create the ACK
+    msg = json.dumps({"ack": sequence_num, "expected_seq" : self.current_sequence_num})
+    # Send the ACK
+    if self.sock.sendto(msg, self.addr) < len(msg):
+      # The ACK failed to send
+      log("[Error]: Unable to fully send packet")
+    else:
+      # The ACK sent
+      log("[Sent ACK]: " + msg)
+
+  # finish when we hit the eof flag
+  def on_finished(self, packet):
+    log("[Recieved EOF]: Stopping...")
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+  MSG_SIZE = 1500
+  TIMEOUT = 1
+  SEQUENCE = 0
+  # Bind to localhost and an ephemeral port
+  UDP_IP = "127.0.0.1"
+  UDP_PORT = 0
+  # initiate sequence from object
+  receiver = Receiver();
+  receiver.receive();

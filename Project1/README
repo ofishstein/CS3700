@@ -1,0 +1,37 @@
+Campbell Alden and Oliver Fishstein
+CS 3700 - Networks and Distributed Systems 
+Project 1
+
+
+High Level Approach
+----
+
+Our high level approach was to create a python script client to meet the project requirements. We chose python due to flexibility of the language and the ease of use for networking purposes and parsing data. 
+
+We created a main function that made use of resuable functions for the various purposes:
+	- parsing command line arguments 
+	- sending messages through the established socket 
+	- calculating the solution from the returned data from the server STATUS messages
+
+This main function follows the following steps:
+	- access the parsed command line arguments
+	- establish the socket based off of those args, using defaults if necessary
+		- we wrap the socket for ssl if -s flag is present
+	- intiate server connection with HELLO message
+	- enter a loop which allows use to continue calculating SOLUTIONs from STATUS messages until we receive a BYE message with a secret flag or throw an error if we receive a malformed message
+		- we make use of regular expressions to parse all response messages 
+		- for solving solutions we make use of python's ability to eval expression that are valid code after parsing the equation from the STATUS message
+
+Challenges
+---
+
+We initially experience a challenge with connecting to ssl but that ended up being due to not connecting to port 27999 for the SSL connection. Otherwise this assignment was straightforward. 
+
+Testing
+---
+
+We tested our regular expressions for parsing by using an online regex tester called pythex.org. We tested the capabilities of eval by writing code in the python interpreter. The main body of the script we just tested by running it against the server, and after successful attempts without SSL we added SSL support. 
+
+
+
+
