@@ -1,0 +1,414 @@
+#!/usr/bin/env python
+
+import sys, traceback,  socket, select, time, json, random
+
+def clock_millis():
+    return int(round(time.time() * 1000))
+
+class DataStore:
+    def __init__(self, self_id, other_ids):
+        self.id = self_id
+        self.replica_ids = other_ids
+        self.last_received_time = clock_millis()
+        self.election_timeout = 200
+        self.leader_timeout = random.randint(150, 300)
+        self.last_sent_time = clock_millis()
+        self.buffer = []
+        self.store = {}
+        self.commit_votes = {}
+
+#       State 
+        self.state = 'follower'
+        self.leader_id = 'FFFF'
+        self.current_term = 0
+        self.voted_for = None
+        self.log = []
+        self.commit_index = 0 # index of highest log entry known to be committed (initialized to 0, increases monotonically)
+        self.last_applied = 0 # index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+        self.votes = []
+
+        self.next_index = {} # for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+        self.match_index = {} # for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.connect(self.id)
+        self.sent_message_count = 0
+
+    def get_mid(self):
+        self.sent_message_count += 1
+        return str(self.id) + str(self.sent_message_count)
+
+    def send_to_followers(self, msg):
+        for send_id in self.replica_ids:
+            msg['dst'] = send_id
+            self.sock.send(json.dumps(msg))
+        self.last_sent_time = clock_millis()
+
+    def get(self, msg):
+        if self.state == 'follower':
+            self.redirect_to_leader(msg)
+            return
+
+        if self.state == 'leader':
+            if msg['key'] in self.store.keys():
+                message = { 'MID': msg['MID'], 'src': self.id, 'dst': msg['src'], 'leader': self.leader_id, 'value': self.store[msg['key']], 'type': 'ok' }
+                self.sock.send(json.dumps(message))
+            else:
+                print "ERROR: key not found in store for replica {} with leader {}".format(self.id, self.leader_id)
+                # self.respond_fail(msg)
+
+    def put(self, msg):
+        if self.state == 'follower':
+            self.redirect_to_leader(msg)
+            return
+
+        if self.state == 'leader':
+            msg['term'] = self.current_term
+            msg['ts'] = clock_millis()
+            self.log.append(msg)
+            self.send_append_entries()
+            return
+
+        self.respond_fail(msg)
+            
+    def handle_append_entries(self, msg):
+        message = {    'MID': msg['MID'], 
+                       'src': self.id, 
+                       'dst': msg['src'], 
+                       'leader': self.leader_id, 
+                       'term': self.current_term, 
+                       'type': 'AppendEntriesResponse', 
+                       'commit_index': msg['leader_commit_index'], 
+                       'success': False  
+                  }
+
+        if msg['term'] < self.current_term:
+            message['commit_index'] = self.commit_index
+            self.sock.send(json.dumps(message))
+#            print "{} term: {} received:{}".format(self.id, self.current_term, msg['term'])
+            return
+       
+        self.current_term = msg['term']
+        message['term'] = self.current_term
+        self.state = 'follower'
+ 
+        if len(self.log) > 0 and len(self.log) <= msg['prevLogIndex']:
+            message['commit_index'] = self.commit_index
+            self.sock.send(json.dumps(message))
+#            print "{} does not have key {} in log".format(self.id, msg['prevLogIndex'])
+            return
+
+        if len(self.log) > 0 and self.log[msg['prevLogIndex']]['term'] != msg['prevLogTerm']:
+            #self.commit_index = msg['prevLogIndex']
+            #self.log = self.log[:self.commit_index]
+            message['commit_index'] = self.commit_index
+            self.sock.send(json.dumps(message))
+#            print "{} has key {} in log, but term doesn't match".format(self.id, msg['prevLogIndex'])
+            return
+
+        if self.commit_index > 0 and self.commit_index > msg['prevLogIndex'] + 1:
+            self.commit_index = msg['prevLogIndex'] + 1
+            self.log = self.log[:self.commit_index]
+
+        for entry in msg['entries']:
+            self.log.append(entry)
+#            print "{} added log entry at {}".format(self.id, self.commit_index)
+            self.commit_index += 1
+
+
+        if min(msg['leader_commit_index'], self.commit_index) > self.last_applied:
+            for i in range(self.last_applied, min(msg['leader_commit_index'], self.commit_index)):
+                store_msg = self.log[i]
+                self.store[store_msg['key']] = store_msg['value']
+            self.last_applied = min(msg['leader_commit_index'], self.commit_index)
+
+#        print "replica {} has log length {}".format(self.id, self.commit_index)
+        message['success'] = True
+        self.sock.send(json.dumps(message))
+        return
+
+    def handle_append_entries_response(self, msg):
+        if msg['term'] > self.current_term:
+            self.state = 'follower'
+            return
+
+        self.match_index[msg['src']] = msg['commit_index'] - 1
+        self.next_index[msg['src']] = msg['commit_index']
+
+        if msg['commit_index'] > self.last_applied and msg['success'] == True:
+            if msg['commit_index'] in self.commit_votes.keys() and msg['src'] not in self.commit_votes[msg['commit_index']]:
+                self.commit_votes[msg['commit_index']].append(msg['src'])
+                if len(self.commit_votes[msg['commit_index']]) > len(self.replica_ids) / 2:
+#                    print "Got {} votes for {}".format(len(self.commit_votes[msg['commit_index']]), msg['commit_index'])
+                    for i in range (self.last_applied, msg['commit_index']):
+                        message = self.log[i]
+                        self.store[message['key']] = message['value']
+                        reply_message = { 'MID': message['MID'], 'src': self.id, 'dst': message['src'], 'leader': self.leader_id, 'type': 'ok' }
+                        self.sock.send(json.dumps(reply_message))
+#                        print "Cleared {}".format(i)
+                    self.last_applied = msg['commit_index']
+#                    print "Leader has log length {}".format(self.last_applied)
+
+    def redirect_to_leader(self, msg):
+        message = { 'MID': msg['MID'], 'src': self.id, 'dst': msg['src'], 'leader': self.leader_id, 'type': 'redirect' }
+        self.sock.send(json.dumps(message))
+
+    def handle_vote_request(self, msg):
+        message = { 'MID': msg['MID'], 'src': self.id, 'dst': msg['src'], 'leader': self.leader_id, 'type': 'VoteResponse', 'vote': False, 'prevLogIndex': self.commit_index, 'term': self.current_term }
+
+#        print "{} received vote request from {}".format(self.id, msg['src'])
+
+        if msg['term'] >= self.current_term:
+            self.current_term = msg['term']
+            if msg['prevLogIndex'] >= self.commit_index:
+                if self.voted_for is None:
+#                    print "{} voted for {}".format(self.id, msg['src'])
+                    self.last_received_time = clock_millis()
+                    message['vote'] = True
+                    self.voted_for = msg['src']
+                    self.leader_id = 'FFFF'
+#                else:
+#                    print "{} received vote request from {} but has already voted for {}".format(self.id, msg['src'], self.voted_for)
+#            else:
+#                print "{} received vote request from {} but self.commit index is {} and msg['prevLogIndex'] is {}".format(self.id, msg['src'], self.commit_index, msg['prevLogIndex'])
+#        else:
+#            print "{} received voted request from {} but self.current_term is {} and msg['term'] is {}".format(self.id, msg['src'], self.current_term, msg['term'])
+
+        self.sock.send(json.dumps(message)) 
+
+    def handle_vote_response(self, msg):
+        if self.state != 'candidate':
+            return
+
+        if msg['vote'] == False and msg['term'] > self.current_term or (msg['term'] == self.current_term and msg['prevLogIndex'] > self.commit_index):
+            self.state = 'follower'
+            return
+
+        if msg['vote'] == True and msg['src'] not in self.votes:
+            self.votes.append(msg['src'])
+            if len(self.votes) > len(self.replica_ids) / 2:
+#                print "{} is new leader, log length {}, term {}".format(self.id, len(self.log), self.current_term)
+                self.state = 'leader'
+                self.leader_id = self.id
+                self.build_match_index()
+                self.build_next_index()
+                message = { 'MID': self.get_mid() , 'src': self.id, 'dst': '', 'leader': self.id, 'type': 'ElectedNotify', 'term': self.current_term }
+                self.send_to_followers(message)
+                self.clear_buffer()
+
+    # init match index for leader
+    def build_match_index(self):
+        self.match_index = {}
+        for follower in self.replica_ids:
+            self.match_index[follower] = self.commit_index
+
+    # init next index for leader
+    def build_next_index(self):
+        self.next_index = {}
+        for follower in self.replica_ids:
+            self.next_index[follower] = self.commit_index + 1
+
+    def handle_elect_notify(self, msg):
+        self.last_received_time = clock_millis()
+        self.state = 'follower'
+        self.leader_id = msg['leader']
+        self.voted_for = None
+        self.clear_buffer()
+
+    def clear_buffer(self):
+        while len(self.buffer) > 0:
+            buffer_msg = self.buffer.pop(0)
+            if buffer_msg['type'] == 'get':
+                self.get(buffer_msg)
+            elif buffer_msg['type'] == 'put':
+                self.put(buffer_msg) 
+
+    def respond_fail(self, msg):
+        message = { 'MID': msg['MID'], 'src': self.id, 'dst': msg['src'], 'leader': self.leader_id, 'type': 'fail' }
+        self.sock.send(json.dumps(message))
+
+
+    def start_election(self):
+        self.last_sent_time = clock_millis()
+        self.state = 'candidate'
+        self.leader_id = 'FFFF'
+        self.current_term += 1
+        self.voted_for = self.id
+        self.votes = [self.id]
+#        print "{} Starting new election, term {}".format(self.id, self.current_term)
+        mid = self.get_mid()
+
+        for send_id in self.replica_ids:
+            message = { 'MID': mid , 'src': self.id, 'dst': send_id, 'leader': 'FFFF', 'type': 'RequestVote', 'term': self.current_term, 'prevLogIndex': self.commit_index }
+            self.sock.send(json.dumps(message))
+    
+    def send_append_entries(self):
+        self.commit_index = len(self.log)
+
+        mid = self.get_mid()
+        message = {    'MID': mid ,
+                       'src': self.id,
+                       'dst': '',
+                       'leader': self.id,
+                       'type': 'AppendEntries',
+                       'term': self.current_term,
+                       'prevLogIndex': 0,
+                       'prevLogTerm': self.current_term,
+                       'entries': '',
+                       'leader_commit_index': self.commit_index
+                  }
+        for send_id in self.replica_ids:
+            try:
+                message['prevLogTerm'] = self.log[self.match_index[send_id]]['term']
+            except:
+                pass
+
+            message['prevLogIndex'] = self.match_index[send_id]
+            message['dst'] = send_id
+            entries = []
+
+            if self.match_index[send_id] < self.commit_index:
+                entries = self.log[self.next_index[send_id]:]
+            
+            if len(entries) > 50:
+    #            print "too many entries to send to {}".format(send_id)
+                entries = []
+
+    #        print "sending {} messages to {}".format(len(entries), send_id) 
+            message['entries'] = entries
+            
+            self.sock.send(json.dumps(message))
+            self.last_sent_time = clock_millis()
+
+        self.commit_votes[self.commit_index] = [self.id]
+
+    def handle_heartbeat(self, msg):
+        message = {    'MID': msg['MID'], 
+                       'src': self.id, 
+                       'dst': msg['src'], 
+                       'leader': self.leader_id, 
+                       'term': self.current_term, 
+                       'type': 'AppendEntriesResponse', 
+                       'commit_index': self.commit_index, 
+                       'success': False  
+                  }
+
+        if msg['term'] < self.current_term:
+            self.sock.send(json.dumps(message))
+            return 
+
+        if self.state != 'follower':
+          #  print "{} switching to follower".format(self.id)
+            self.state = 'follower'
+            message['success'] = True
+            self.sock.send(json.dumps(message))
+            return
+
+        if min(msg['leader_commit_index'], self.commit_index) > self.last_applied:
+#            print "{} applying to store from {} to {}".format(self.id, self.last_applied, min(msg['leader_commit_index'], self.commit_index))
+            for i in range(self.last_applied, min(msg['leader_commit_index'], self.commit_index)):
+                store_msg = self.log[i]
+                self.store[store_msg['key']] = store_msg['value']
+            self.last_applied = min(msg['leader_commit_index'], self.commit_index)
+
+        #print "{} sending success".format(self.id)
+        message['success'] = True
+        self.sock.send(json.dumps(message))
+        return
+
+
+    def run(self):
+        while True:
+            ready = select.select([self.sock], [], [], 0.05)[0]
+            
+            if self.sock in ready:
+                msg_raw = self.sock.recv(32768)
+
+                if len(msg_raw) == 0: continue
+                msg = json.loads(msg_raw)
+
+                if self.state == 'candidate' and clock_millis() - self.last_sent_time > self.election_timeout:
+                    self.state = 'follower'
+                    self.voted_for = None
+
+                if clock_millis() - self.last_received_time > self.election_timeout:
+                    self.voted_for = None
+ 
+                if msg['leader'] != 'FFFF' and msg['leader'] == self.leader_id:
+                    self.last_received_time = clock_millis()
+
+                if msg['type'] == 'get':
+                    if self.state == 'candidate' or self.leader_id == 'FFFF':
+                        self.buffer.append(msg)
+                    else:
+                        self.get(msg)
+
+                if msg['type'] == 'put':
+                    if self.state == 'candidate' or self.leader_id == 'FFFF':
+                        self.buffer.append(msg)
+                    else:
+                        self.put(msg)
+
+                if msg['type'] == 'AppendEntries':
+                    self.last_received_time = clock_millis()
+                    if len(msg['entries']) > 0:
+                        self.handle_append_entries(msg)
+                    else:
+                        self.handle_heartbeat(msg)
+
+                if msg['type'] == 'AppendEntriesResponse' and self.state == 'leader':
+                    self.handle_append_entries_response(msg)
+
+                if msg['type'] == 'RequestVote':
+                    self.handle_vote_request(msg)
+
+                if msg['type'] == 'VoteResponse':
+                    self.handle_vote_response(msg)
+  
+                if msg['type'] == 'ElectedNotify':
+                    self.handle_elect_notify(msg)
+
+                if msg['type'] == 'fail':
+                    print "Received fail from {}".format(msg['src'])
+
+            if self.state == 'follower' and clock_millis() - self.last_received_time > self.leader_timeout:
+                self.start_election()
+
+            if self.state == 'leader':
+#                if self.commit_index < len(self.log):
+#                    self.send_append_entries()
+
+                if clock_millis() - self.last_sent_time > 100:
+#                    print "Leader sending keep-alive"
+                    self.send_append_entries()
+#                    message = { 'MID': self.get_mid() , 'src': self.id, 'dst': '', 'leader': self.id, 'type': 'AppendEntries', 'entries': '', 'term': self.current_term}
+#                    self.send_to_followers(message)
+
+
+if __name__ == "__main__":
+    try:
+        dataStore = DataStore(sys.argv[1], sys.argv[2:])
+        dataStore.run()
+    except BaseException as e:
+        print str(sys.argv[1]) + ":   " + str(e)
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        print "*** print_tb:"
+        traceback.print_tb(exc_traceback, limit=1, file=sys.stdout)
+        print "*** print_exception:"
+        traceback.print_exception(exc_type, exc_value, exc_traceback,
+                              limit=2, file=sys.stdout)
+        print "*** print_exc:"
+        traceback.print_exc()
+        print "*** format_exc, first and last line:"
+        formatted_lines = traceback.format_exc().splitlines()
+        print formatted_lines[0]
+        print formatted_lines[-1]
+        print "*** format_exception:"
+        print repr(traceback.format_exception(exc_type, exc_value,
+                                          exc_traceback))
+        print "*** extract_tb:"
+        print repr(traceback.extract_tb(exc_traceback))
+        print "*** format_tb:"
+        print repr(traceback.format_tb(exc_traceback))
+        print "*** tb_lineno:", exc_traceback.tb_lineno
+

@@ -1,0 +1,84 @@
+Project 5:
+
+- Sending messages between instances:
+    - src
+    - dest
+    - leader
+    - type
+
+To Do:
+DONE 1. Add basic support for responding to client get() and put() requests. At this point, you can respond to all requests with a "type": "fail" message.
+DONE 2. Implement the Raft election protocol (section 5.2 of the Raft paper); add the ability to respond to get() and put() requests with "type": "redirect" messages.
+DONE 3. Add a timeout to detect leader failures (i.e. if you don't hear from the leader in X milliseconds...) and make sure that the new election proceeds correctly.
+DONE 4. Implement a basic, empty version of the AppendEntries RPC call that doesn't replicate any data, but acts as a keepalive message from the leader to other replicas to prevent unnecessary elections.
+DONE 5. Implement the transaction log and the "state machine" (i.e. a dictionary containing the key/value pairs from clients, Section 5.3). Don't bother replicating the transactions, just ensure that the leader is able to correctly answer get() and put() requests.
+DONE 6. Improve your AppendEntries RPC call to actually send data to replicas. Ensure that updates are only committing when a quorum is in agreement.
+7. Add support for retrying failed commits and test it by experimenting with lossy network simulations.
+8. If you haven't already, modify the leader election to support the additional restrictions in Section 5.4.1; test your implementation on lossy networks with failed leaders.
+9. Implement the subtle commit restriction given in Section 5.4.2.
+10. Test
+
+Raft notes:
+- Distinguished leader:
+    - Leader has complete responsibility for managing and replicating the log
+    - Accepts log entries from clients, replicates them on other servers, and tells servers when it is safe to apply log entries to their state machines
+
+- Server can be in one of the three states: leader, follower, or candidate
+    - Followers redirect all requests to leader
+
+- Time is divided into terms
+    - Begins with an election, where one or more candidates can try to become leader
+    - If the votes are split, the term ends and a new term starts
+    - Each server stores a current term number, exchanged whenever servers communicate
+    - If a candidate or leader discovers that its term is out of date, it immediately reverts to follower state
+    - If a server receives a request with a stale term number, it rejects the request
+
+- Raft servers communicate using remote procedure calls (RPCs)
+    - RequestVote RPCs: initiated by candidates during elections
+    - AppendEntries RPCs: initiated by leaders to replicate log entries and to provide a form of heartbeat
+
+- Leader Election:
+    - Servers start up as followers, remains as such so long as it receives valid RPCs from a leader or candidate
+    - Leaders send heartbeats (AppendEntries RPCs that carry no log entries)
+    - If a follower receives no communication over a period of time (election timeout) it assumes there is no viable leader and begins an election to choose a new leader
+        - Increment term
+        - Transition to candidate
+        - Votes for itself, issues RequestVotes RPCs to other servers
+        - Continues until either:
+            - it wins the election
+            - an other server establishes itself as leader
+            - period of time ends without winner
+        - Each server votes in a first-come-first-serve basis
+        - Once new leader wins, it sends heartbeat to establish its leadership
+        - While waiting for votes, a candidate may receive AppendEntries RPCs from another server claiming to be leader, if term is at least as large as candidate’s current term, then it is recognized as the new leader
+        - To prevent split votes, election timeouts are chosen at random, 150-300ms
+
+- Log replication:
+    - Client requests are appended to the log as a new entry
+    - AppendEntries RPCs are issued to each of the other servers
+    - When the entry has been safely replicated, the leader applies the entry to its state machine, returns result of execution to client
+    - If followers crash or run slowly, or if network packets are lost, the leader retries AppendEntries RPCs indefinitely (even after it has responded to the client) until all followers eventually store all log entries
+    - Log entry organization:
+        - Stores state machine command along with term number, at int index identifying position in log
+    - A log entry is committed once the leader that created the entry has replicated it on a majority of the servers
+    - This also commits all preceding entries in the leader’s log
+    - Leader keeps track of the highest index it knows to be committed and includes that index in future AppendEntries RPCs
+    - Once a follower lear that a log entry is committed, it applies the entry to its local state machine (in log order)
+    - When leader sends AppendEntries RPC, the leader includes the index and term of the entry in its log that immediately precedes the new entries. If the follower does not find an entry in its log with the same index and term, then it refuses the new entries
+    - If there are inconsistencies when a leader is elected, leader forces followers’ logs to duplicate its own
+        - Find latest log entry where its own and the follower’s agree, delete any entries after that point, and send follower any entries after that point
+    - Leader maintains nextIndex for each follower, which is the index of the next log entry the leader will send to that follower
+    - When it comes into power, it initializes all nextIndex values to the index just after the last one in its log
+        - If there is inconsistencies, the AppendEntries RPC will fail, leader decrements the count and sends out again until it succeeds
+
+- Election Restriction:
+    - Candidate cannot be elected if it doesn’t contain all committed messages
+    - RequestVote RPC includes info on the candidate’s log, voter denies it if candidate’s log isn’t as up-to-date as its own
+    - If leader crashes before it can commit a message, the next leader will try to finish the action
+        - Leader cannot conclude that an entry from a previous term is committed once it is stored on a majority of servers
+        - Never commit log entries from previous terms by counting replicas
+        - Only log entries from the leader’s current term are committed by counting replicas
+
+- Follower and candidate crashes:
+    - If a crash occurs, retry indefinitely
+
